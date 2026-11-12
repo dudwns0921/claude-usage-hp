@@ -7,6 +7,8 @@ import Foundation
 // the rate-limit windows.
 //
 //   usage-hp-menubar                          run in the menu bar
+//       [--data-dir <dir>]                    read the entries from another folder
+//   USAGE_HP_DEBUG=1 usage-hp-menubar         also say on stderr when the folder changes
 //   usage-hp-menubar --snapshot <png>         draw the panel to a PNG and exit
 //       [--data-dir <dir>]                    read the entries from another folder
 //       [--theme <name>]                      draw it in that theme
@@ -56,18 +58,102 @@ func loadLabels() -> [String: String] {
     return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
 }
 
+func debug(_ text: @autoclosure () -> String) {
+    guard ProcessInfo.processInfo.environment["USAGE_HP_DEBUG"] == "1" else { return }
+    FileHandle.standardError.write((text() + "\n").data(using: .utf8) ?? Data())
+}
+
+// The last reading each file parsed to. A file caught half written does not
+// parse; its block keeps what it showed until the file reads whole again.
+var lastParsed: [String: Reading] = [:]
+// A file did not parse on the last load, so the load is worth repeating soon.
+var hadUnreadableFile = false
+
 // Every readable entry with at least one window, newest first.
 func loadEntries() -> [Entry] {
-    let names = (try? FileManager.default.contentsOfDirectory(atPath: dataFolder)) ?? []
-    let entries: [Entry] = names
+    let names = ((try? FileManager.default.contentsOfDirectory(atPath: dataFolder)) ?? [])
         .filter { $0.hasSuffix(".json") && $0 != labelsFile }
-        .compactMap { name in
-            guard let data = FileManager.default.contents(atPath: dataFolder + "/" + name),
-                  let reading = try? JSONDecoder().decode(Reading.self, from: data),
-                  !reading.limits.isEmpty else { return nil }
-            return (reading, parseDate(reading.updatedAt))
+    var parsed: [String: Reading] = [:]
+    hadUnreadableFile = false
+
+    for name in names {
+        if let data = FileManager.default.contents(atPath: dataFolder + "/" + name),
+           let reading = try? JSONDecoder().decode(Reading.self, from: data) {
+            parsed[name] = reading
+        } else if let before = lastParsed[name] {
+            parsed[name] = before
+            hadUnreadableFile = true
+        } else {
+            hadUnreadableFile = true
         }
-    return entries.sorted { ($0.updated ?? .distantPast) > ($1.updated ?? .distantPast) }
+    }
+
+    // A file that is gone takes its block with it.
+    lastParsed = parsed
+
+    let entries: [Entry] = parsed.values
+        .filter { !$0.limits.isEmpty }
+        .map { ($0, parseDate($0.updatedAt)) }
+    return entries.sorted {
+        let (a, b) = ($0.updated ?? .distantPast, $1.updated ?? .distantPast)
+        return a != b ? a > b : ($0.reading.organizationId ?? "") < ($1.reading.organizationId ?? "")
+    }
+}
+
+// Watches the data folder, so a reading shows the moment the mod writes it.
+// File-level events: the mod rewrites existing files, which a watch on the
+// folder alone would not report. A burst of events is one reload.
+final class FolderWatcher {
+    let path: String
+    let onChange: () -> Void
+    private var stream: FSEventStreamRef?
+    private var pending: DispatchWorkItem?
+
+    init(path: String, onChange: @escaping () -> Void) {
+        self.path = path
+        self.onChange = onChange
+    }
+
+    var isWatching: Bool { stream != nil }
+
+    // The folder may not be there yet (the mod makes it on its first write),
+    // so this is tried again until it is.
+    func startIfPossible() {
+        var isFolder: ObjCBool = false
+        guard stream == nil, FileManager.default.fileExists(atPath: path, isDirectory: &isFolder),
+              isFolder.boolValue else { return }
+
+        var context = FSEventStreamContext(
+            version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil,
+            copyDescription: nil)
+        let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
+
+        guard let made = FSEventStreamCreate(
+            nil,
+            { _, info, count, _, _, _ in
+                guard let info else { return }
+                debug("usage-hp: change event (\(count))")
+                Unmanaged<FolderWatcher>.fromOpaque(info).takeUnretainedValue().changed()
+            },
+            &context, [path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.05, flags)
+        else { return }
+
+        FSEventStreamSetDispatchQueue(made, .main)
+        guard FSEventStreamStart(made) else {
+            FSEventStreamInvalidate(made)
+            FSEventStreamRelease(made)
+            return
+        }
+        stream = made
+        debug("usage-hp: watching \(path)")
+    }
+
+    private func changed() {
+        pending?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.onChange() }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
 }
 
 // MARK: - Wording
@@ -745,7 +831,15 @@ func snapshot(to path: String) -> Bool {
 final class Controller: NSObject {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let hud = Hud()
+    lazy var watcher = FolderWatcher(path: dataFolder) { [weak self] in
+        debug("usage-hp: reload after change")
+        self?.refresh()
+    }
+    private var retry: DispatchWorkItem?
 
+    // The watcher shows a new reading at once. The timer stays for what no
+    // file change announces: an age growing ("now" to "1m"), a window going
+    // back to full when its reset time passes, and the folder first appearing.
     func start() {
         refresh()
         let timer = Timer(timeInterval: refreshSeconds, repeats: true) { [weak self] _ in self?.refresh() }
@@ -755,9 +849,18 @@ final class Controller: NSObject {
     func refresh() {
         let now = Date()
         let menu = NSMenu()
+        watcher.startIfPossible()
         let entries = loadEntries()
         let labels = loadLabels()
         hud.update(entries, labels: labels, now: now)
+
+        // A file caught half written: look again shortly, not at the next tick.
+        retry?.cancel()
+        if hadUnreadableFile {
+            let again = DispatchWorkItem { [weak self] in self?.refresh() }
+            retry = again
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: again)
+        }
 
         // The title is the entry used last; the panel shows them all, and the
         // menu holds only the actions.
@@ -774,10 +877,6 @@ final class Controller: NSObject {
     }
 
     func finish(_ menu: NSMenu) {
-        let reload = NSMenuItem(title: "지금 다시 읽기", action: #selector(reloadNow), keyEquivalent: "r")
-        reload.target = self
-        menu.addItem(reload)
-        menu.addItem(.separator())
         let toggle = NSMenuItem(
             title: hud.isHidden ? "플로팅 창 보이기" : "플로팅 창 숨기기", action: #selector(toggleHud), keyEquivalent: "")
         toggle.target = self
@@ -810,7 +909,6 @@ final class Controller: NSObject {
         item.button?.attributedTitle = NSAttributedString(string: text, attributes: attributes)
     }
 
-    @objc func reloadNow() { refresh() }
     @objc func toggleHud() {
         hud.isHidden.toggle()
         refresh()

@@ -29,7 +29,7 @@ Checking how much of a Claude plan is left usually means keeping a usage page op
 - **Reset time** for every window, in local time; a reset on a later day also shows its date.
 - **Age of each reading** (`now`, `4m`, `2h`, `3d`), so a stale number is visible as stale.
 - **Dot-matrix terminal look**: a near-black square panel with notched corners and monospaced text, in six built-in colour themes.
-- **Menu bar item** showing the most recently updated plan, for example `5h 61% · 7d 67%`. Its menu holds the actions: re-read, hide or show the HUD, theme, quit.
+- **Menu bar item** showing the most recently updated plan, for example `5h 61% · 7d 67%`. Its menu holds the actions: hide or show the HUD, theme, quit.
 - **Always-on-top HUD** that never takes keyboard focus, shows on every Space and beside full-screen apps, can be dragged anywhere, and can be resized from its bottom-right corner (1.0x to 2.5x). It remembers its position and size, and can be hidden from the menu.
 - **Optional custom names** per plan through a small `labels.json` file.
 - **No tokens, no credentials, no network.** The app only reads local JSON files.
@@ -58,7 +58,7 @@ usage-hp mod  (silent: draws nothing)
         │  writes the latest reading, one file per plan
         ▼
 ~/.claude/usage-hp/<account>__<organization>.json
-        │  re-read every 30 seconds
+        │  watched: re-read the moment a file changes
         ▼
 menu bar item + floating HUD
 ```
@@ -112,7 +112,7 @@ The mod runs inside Claude Code and has no interface of its own. The macOS app n
    <repo folder>/menubar/usage-hp-menubar &
    ```
 
-6. Restart any Claude Code session that was already open so it loads the mod. After a session receives one response, its plan appears within 30 seconds.
+6. Restart any Claude Code session that was already open so it loads the mod. After a session receives one response, its plan appears at once.
 
 ### Start at login (optional)
 
@@ -142,8 +142,8 @@ rm ~/Library/LaunchAgents/com.local.usage-hp-menubar.plist
 
 - **HUD**: drag it anywhere to move it. Each block is one plan; `5H` is the 5-hour window and `7D` the weekly window. The dots and the percentage show what is **left**, not what is used. With no reading yet it shows one line, `측정값 없음`.
 - **Resizing**: the three small squares in the HUD's bottom-right corner are a resize grip. Drag it to scale the whole HUD uniformly, from 1.0x (the base size, also the minimum) up to 2.5x. Double-click it to go back to 1.0x. The scale is remembered.
-- **Menu bar item**: the title follows the most recently updated plan and turns orange at 50% or less left, red below 20%. Plan details are shown in the HUD only; the menu holds the four actions below.
-- **지금 다시 읽기** re-reads the files immediately instead of waiting for the 30-second timer.
+- **Menu bar item**: the title follows the most recently updated plan and turns orange at 50% or less left, red below 20%. Plan details are shown in the HUD only; the menu holds the three actions below.
+- **Updates are immediate**: the app watches `~/.claude/usage-hp/` and redraws as soon as the mod writes a reading, so there is nothing to press. A 30-second timer remains only for what no file change announces: the age beside each plan growing (`now` to `1m`) and a window going back to 100% when its reset time passes.
 - **플로팅 창 숨기기 / 보이기** hides or shows the HUD. The choice is remembered.
 - **테마** switches the colour theme.
 - **종료** quits the app.
@@ -191,7 +191,7 @@ The app makes one undocumented CoreGraphics call (`CGSSetConnectionProperty` wit
 
 - Use that plan once in a Claude Code session on this Mac and wait for a response.
 - Make sure the mod is installed in the config directory that session uses (see step 3 of Installation), and that the session was started after installing.
-- Wait up to 30 seconds, or choose **지금 다시 읽기** from the menu bar item.
+- A reading appears as soon as the session writes it; there is no need to wait or to re-read by hand. If nothing appears after a response, the session is not writing: check the two points above.
 
 **Two menu bar items appear**
 
@@ -219,7 +219,7 @@ If you set up start at login, run the two commands that turn it off as well. Del
 
 ## Development
 
-The app has four options for working on the look without touching real data: `--snapshot <png>` draws the panel to a PNG file and exits, `--data-dir <dir>` reads the readings from another folder instead of `~/.claude/usage-hp/`, `--theme <name>` draws in that theme, and `--scale <n>` draws at that size (1 to 2.5). The images in `docs/` were made this way from sample files.
+The app has a few options for working on the look without touching real data: `--snapshot <png>` draws the panel to a PNG file and exits, `--data-dir <dir>` reads the readings from another folder instead of `~/.claude/usage-hp/`, `--theme <name>` draws in that theme, `--scale <n>` draws at that size (1 to 2.5), and `--hover-grip` draws the resize corner as it looks under the pointer. `--data-dir` also works without `--snapshot`, to run the app on sample files, and setting `USAGE_HP_DEBUG=1` makes it say on stderr when the watched folder changes. The images in `docs/` were made this way from sample files.
 
 ## Contributing
 
