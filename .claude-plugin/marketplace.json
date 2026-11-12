@@ -1,0 +1,11 @@
+{
+  "name": "claude-usage-hp",
+  "owner": { "name": "dudwns0921" },
+  "plugins": [
+    {
+      "name": "usage-hp",
+      "source": "./usage-hp",
+      "description": "Writes each session's plan rate-limit readings to ~/.claude/usage-hp/ for the menu bar HUD"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "usage-hp",
+  "version": "0.1.0",
+  "description": "Writes each session's plan rate-limit readings to ~/.claude/usage-hp/ for the menu bar HUD; draws nothing",
+  "types": "./types/index.d.ts"
+}
