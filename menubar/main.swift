@@ -380,6 +380,16 @@ final class HudCanvas: NSView {
         NSCursor.arrow.set()
     }
 
+    // Lets go of the grip and gives the arrow back: the panel is going away,
+    // or its corner is no longer under the pointer. A resize cursor must never
+    // outlive the hover, since the window server honours it in the background.
+    func dropGrip() {
+        guard isGripLit || resizeStart != nil else { return }
+        resizeStart = nil
+        isGripLit = false
+        NSCursor.arrow.set()
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard gripRect.contains(convert(event.locationInWindow, from: nil)) else {
             window?.performDrag(with: event)
@@ -390,6 +400,8 @@ final class HudCanvas: NSView {
             resizeStart = nil
             onResize?(1)
             onResizeEnd?()
+            // The corner has moved out from under the pointer.
+            dropGrip()
             return
         }
 
@@ -632,7 +644,12 @@ final class Hud: NSObject, NSWindowDelegate {
         canvas.show(entries, labels: labels, now: now, theme: currentTheme(), scale: scale)
         fit()
 
-        if isHidden { panel.orderOut(nil) } else { panel.orderFrontRegardless() }
+        if isHidden {
+            canvas.dropGrip()
+            panel.orderOut(nil)
+        } else {
+            panel.orderFrontRegardless()
+        }
     }
 
     // Top-right of the main screen, under the menu bar.
@@ -802,7 +819,33 @@ final class Controller: NSObject {
         settings.set(sender.title, forKey: "theme")
         refresh()
     }
-    @objc func quitNow() { NSApp.terminate(nil) }
+    @objc func quitNow() {
+        hud.canvas.dropGrip()
+        NSCursor.arrow.set()
+        NSApp.terminate(nil)
+    }
+}
+
+// An UNDOCUMENTED CoreGraphics call, the only one in this app. This app is
+// never the active one (the panel must not take the keyboard), and the window
+// server ignores a cursor set by an app in the background, so without this the
+// resize cursor never shows over the panel's corner. It asks the window server
+// to honour this process's cursor while in the background, as overlay
+// utilities have long done. The app works without it; only the cursor's shape
+// is lost (the corner still lights up). The two functions are looked up at run
+// time, so a system that no longer has them, or a call that fails, changes
+// nothing else.
+func allowCursorInBackground() {
+    typealias DefaultConnection = @convention(c) () -> Int32
+    typealias SetProperty = @convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32
+
+    let anywhere = UnsafeMutableRawPointer(bitPattern: -2)  // RTLD_DEFAULT
+    guard let connectionSymbol = dlsym(anywhere, "_CGSDefaultConnection"),
+          let propertySymbol = dlsym(anywhere, "CGSSetConnectionProperty") else { return }
+
+    let connection = unsafeBitCast(connectionSymbol, to: DefaultConnection.self)()
+    _ = unsafeBitCast(propertySymbol, to: SetProperty.self)(
+        connection, connection, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
 }
 
 let app = NSApplication.shared
@@ -812,6 +855,7 @@ if let path = argument("--snapshot") {
     exit(snapshot(to: path) ? 0 : 1)
 }
 
+allowCursorInBackground()
 let controller = Controller()
 controller.start()
 app.run()

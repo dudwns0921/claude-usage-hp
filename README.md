@@ -175,6 +175,8 @@ What the app reads and writes:
 
 Nothing else. No OAuth token, session cookie, API key or Keychain item is read. Neither part makes a network request, and nothing leaves your Mac. Note that the files in `~/.claude/usage-hp/` contain your account email in plain text, and the HUD shows it on screen; both stay local.
 
+The app makes one undocumented CoreGraphics call (`CGSSetConnectionProperty` with `SetsCursorInBackground`), solely so the resize cursor can appear over the HUD's corner while the app is in the background; it is looked up at run time, and the app works without it.
+
 ## Limitations
 
 - **A plan appears only after it has been used once on this Mac in a Claude Code session.** Being signed in is not enough.
