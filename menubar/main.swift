@@ -14,6 +14,34 @@ import Foundation
 //       [--theme <name>]                      draw it in that theme
 //       [--scale <n>]                         draw it at that size, 1 to 2.5
 //       [--hover-grip]                        draw the resize corner as under the pointer
+//       [--server-on <organization id>]       draw that block as read from the server
+//       [--server-failed <organization id>]   draw that block as failing to (both repeatable)
+//
+// Server mode (server.swift) is off for every account until it is ticked in
+// the menu. The stored choice is used only with the real folders: with
+// --home, --data-dir or --server-on, only the accounts named by --server-on
+// are on, for that run.
+//
+//   usage-hp-menubar --server-accounts        list the logins found; the keychain is not read
+//                                             (the default folder's is marked as excluded)
+//       [--home <dir>]                        look for config folders under another home
+//   usage-hp-menubar --server-apply <json>    write a saved answer as that login's reading
+//       --config-dir <dir>                    (no keychain, no network)
+//   usage-hp-menubar --server-once <organization id>
+//                                             ask the server once for that account
+//       [--dump-shape]                        print only the names and kinds in the answer
+//       [--dump-profile-shape]                the same for the profile answer, and which of
+//                                             its ids are this login's organization id
+//   usage-hp-menubar --server-backoff-table   print the waits after each outcome
+//   usage-hp-menubar --server-menu-titles     print the submenu's wording for each outcome
+//   usage-hp-menubar --server-menu            print the submenu's rows
+//
+// An argument that is none of these ends the run with an error, and so does
+// a second --home, --data-dir or --server-once, or an option given without
+// the one it belongs to (--dump-shape without --server-once). Each option
+// and its value are two arguments: "--home=<dir>" is not read. Of the
+// arguments with one dash, only the system's are let through
+// ("-AppleLanguages (ko)", "-NS...", "-psn_...").
 
 struct Limit: Decodable {
     let kind: String
@@ -26,6 +54,8 @@ struct Reading: Decodable {
     let organizationId: String?
     let organization: String?
     let plan: String?
+    // Who wrote the file: the mod's entry point, or "server".
+    let source: String?
     let updatedAt: String
     let limits: [Limit]
 }
@@ -38,7 +68,86 @@ func argument(_ name: String) -> String? {
     return arguments[index + 1]
 }
 
-let dataFolder = argument("--data-dir") ?? NSHomeDirectory() + "/.claude/usage-hp"
+// Every value given for an option that can be repeated.
+func arguments(named name: String) -> [String] {
+    let all = CommandLine.arguments
+    return all.indices.filter { all[$0] == name && $0 + 1 < all.count }.map { all[$0 + 1] }
+}
+
+// Every option, and whether a value follows it.
+let knownOptions: [String: Bool] = [
+    "--data-dir": true, "--snapshot": true, "--theme": true, "--scale": true, "--hover-grip": false,
+    "--server-on": true, "--server-failed": true, "--home": true, "--config-dir": true,
+    "--server-accounts": false, "--server-apply": true, "--server-once": true, "--dump-shape": false,
+    "--dump-profile-shape": false,
+    "--server-backoff-table": false, "--server-menu-titles": false, "--server-menu": false,
+]
+
+// What is wrong with the arguments, or nil. An option this app does not know
+// would otherwise be skipped without a word, and a run meant for a test
+// folder ("--home=<dir>", or the option and its folder quoted as one
+// argument) would go on with the real home and the stored accounts.
+//
+// Arguments with a single dash are let through only when they are the ones
+// Xcode and macOS add ("-NSDocumentRevisionsDebugMode YES",
+// "-AppleLanguages (ko)", "-psn_..."): ending the run over one would leave
+// no menu bar item and no word why. Any other is taken for a mistyped option
+// of this app ("-home <dir>"), which would otherwise run on the real home.
+func argumentError(_ all: [String]) -> String? {
+    // The folders everything is read from and written to, and the account
+    // asked for: with two of one, the first would be used without a word.
+    let onlyOnce: Set<String> = ["--home", "--data-dir", "--server-once"]
+    var seen: Set<String> = []
+    var index = 0
+    while index < all.count {
+        let name = all[index]
+        if name.hasPrefix("-psn_") {
+            // A process serial number is one argument.
+            index += 1
+            continue
+        }
+        if name.hasPrefix("-NS") || name.hasPrefix("-Apple") {
+            // A defaults override, read by the system as a name and a value.
+            let hasValue = index + 1 < all.count && !all[index + 1].hasPrefix("-")
+            index += hasValue ? 2 : 1
+            continue
+        }
+        guard let takesValue = knownOptions[name] else { return "unknown argument: " + name }
+        if !seen.insert(name).inserted, onlyOnce.contains(name) { return "given twice: " + name }
+        if takesValue {
+            guard index + 1 < all.count, !all[index + 1].hasPrefix("--") else { return "no value for " + name }
+            index += 1
+        }
+        index += 1
+    }
+
+    // An option that does nothing without another one: left alone, the run
+    // would go on as the widget, on the real home, as if nothing were asked.
+    func needs(_ name: String, _ others: [String]) -> String? {
+        guard seen.contains(name), seen.isDisjoint(with: others) else { return nil }
+        return name + " needs " + others.joined(separator: " or ")
+    }
+    let modes: Set<String> = [
+        "--snapshot", "--server-accounts", "--server-apply", "--server-once", "--server-backoff-table",
+        "--server-menu-titles", "--server-menu",
+    ]
+    // Without a mode, --server-on names the accounts the widget polls.
+    let onIsRead = seen.isDisjoint(with: modes) ? nil : needs("--server-on", ["--snapshot", "--server-menu"])
+    return needs("--dump-shape", ["--server-once"])
+        ?? needs("--dump-profile-shape", ["--server-once"])
+        ?? needs("--config-dir", ["--server-apply"])
+        ?? needs("--server-failed", ["--snapshot", "--server-menu"])
+        ?? onIsRead
+}
+
+// Before anything is read: the folders below are worked out from the options.
+if let error = argumentError(Array(CommandLine.arguments.dropFirst())) {
+    FileHandle.standardError.write(("usage-hp-menubar: " + error + "\n").data(using: .utf8) ?? Data())
+    exit(2)
+}
+
+// Under --home when that is given, so a test home never reaches the real folder.
+let dataFolder = argument("--data-dir") ?? homeFolder + "/.claude/usage-hp"
 // Optional, written by the person: { "<organization id>": "회사 팀" }.
 let labelsFile = "labels.json"
 let refreshSeconds: TimeInterval = 30
@@ -326,6 +435,12 @@ func hudAccount(_ reading: Reading, limit: Int) -> String {
     return String(email.prefix(max(limit - 1, 0))) + "…"
 }
 
+// How a block that is read from the server is marked: by the person's choice,
+// not by who wrote the file last.
+enum ServerMark { case on, failed }
+
+// "2m". That an account is read from the server, and that the last attempt
+// at that failed, is the badge's to say, not the age's.
 func hudAge(_ updated: Date?, now: Date) -> String {
     guard let updated else { return "" }
     let minutes = Int(now.timeIntervalSince(updated) / 60)
@@ -333,6 +448,96 @@ func hudAge(_ updated: Date?, now: Date) -> String {
     if minutes < 60 { return "\(minutes)m" }
     if minutes < 60 * 24 { return "\(minutes / 60)h" }
     return "\(minutes / (60 * 24))d"
+}
+
+// MARK: - The server submenu's wording
+
+// One account's line: its name, and after it why it cannot be read, if so.
+func serverMenuTitle(label: String, hasLogin: Bool, outcome: ServerOutcome?) -> String {
+    guard hasLogin else { return label + " — 터미널 로그인 없음" }
+
+    switch outcome {
+    case nil, .ok:
+        return label
+    case .noLogin:
+        return label + " — 터미널 로그인 없음"
+    case .excluded:
+        return label + " — 기본 폴더 로그인은 아직 지원 안 함"
+    case .unreadableFile:
+        return label + " — 기록 파일을 읽을 수 없음"
+    case .wrongOrganization:
+        return label + " — 다른 조직으로 로그인됨"
+    case .expired, .unauthorized:
+        return label + " — 로그인 만료 · claude 를 한 번 실행해 주세요"
+    case .rateLimited:
+        return label + " — 요청 제한 · 잠시 후 다시 시도"
+    case .serverError:
+        return label + " — 서버 응답 오류"
+    case .offline:
+        return label + " — 연결 안 됨"
+    case .noKeychainItem:
+        return label + " — 키체인에 로그인 없음"
+    case .noData:
+        return label + " — 데이터 없음"
+    }
+}
+
+struct ServerRow {
+    let organizationId: String
+    let title: String
+    let isOn: Bool
+    let isEnabled: Bool
+}
+
+// The submenu's lines: every login found, then every account that has a file
+// but no login, then every ticked account that has neither. A login with no
+// file yet is listed too (ticking it makes the file). An account with no
+// login, or only one that server mode leaves alone, cannot be ticked, only
+// unticked.
+func serverRows(logins: [Login], entries: [Entry], labels: [String: String], ticked: [String],
+                isOn: (String) -> Bool, outcome: (String) -> ServerOutcome?) -> [ServerRow] {
+    var readings: [String: Reading] = [:]
+    for entry in entries {
+        if let id = known(entry.reading.organizationId), readings[id] == nil { readings[id] = entry.reading }
+    }
+
+    // Named as the panel names it: the plan or the person's label, then the email.
+    func row(_ id: String, _ reading: Reading, login: Login?) -> ServerRow {
+        let label = hudPlan(reading, labels: labels) + " · " + (known(reading.account) ?? String(id.prefix(8)))
+        let on = isOn(id)
+        // Said whether ticked or not: it is why the line cannot be ticked.
+        if login?.isExcluded == true {
+            return ServerRow(
+                organizationId: id, title: serverMenuTitle(label: label, hasLogin: true, outcome: .excluded),
+                isOn: on, isEnabled: on)
+        }
+        return ServerRow(
+            organizationId: id,
+            title: serverMenuTitle(label: label, hasLogin: login != nil, outcome: on ? outcome(id) : nil),
+            isOn: on, isEnabled: login != nil || on)
+    }
+
+    var rows: [ServerRow] = []
+    for login in logins {
+        let reading = readings[login.organizationId] ?? Reading(
+            account: login.email, organizationId: login.organizationId, organization: login.organization,
+            plan: login.plan, source: nil, updatedAt: "", limits: [])
+        rows.append(row(login.organizationId, reading, login: login))
+    }
+    for id in readings.keys.sorted() where !logins.contains(where: { $0.organizationId == id }) {
+        if let reading = readings[id] { rows.append(row(id, reading, login: nil)) }
+    }
+
+    // Ticked, then logged out and its file removed: only the id is left to
+    // name it by. Without a line it could not be unticked, and would be read
+    // again, unasked, the day a folder logs in to it.
+    for id in ticked where !rows.contains(where: { $0.organizationId == id }) {
+        rows.append(ServerRow(
+            organizationId: id,
+            title: serverMenuTitle(label: String(id.prefix(8)), hasLogin: false, outcome: nil),
+            isOn: true, isEnabled: true))
+    }
+    return rows
 }
 
 // MARK: - The panel's drawing
@@ -374,6 +579,8 @@ final class HudCanvas: NSView {
     var now = Date()
     var theme = themes[0]
     var scale: CGFloat = 1
+    // By organization id: the blocks read from the server.
+    var serverMarks: [String: ServerMark] = [:]
 
     // Dragging the grip asks for a size; letting go, or a double click (back
     // to the natural size), settles it.
@@ -562,6 +769,23 @@ final class HudCanvas: NSView {
             string.draw(at: NSPoint(x: snap(left), y: snap(top + (height - size.height) / 2)))
         }
 
+        // The text, or as much of its start as fits in `width` with "…" after
+        // it. Measured, not counted: a label can hold letters the monospaced
+        // font does not have, drawn wider from another one.
+        func fitted(_ text: String, _ font: NSFont, width: CGFloat) -> String {
+            func measure(_ text: String) -> CGFloat {
+                NSAttributedString(string: text, attributes: [.font: font]).size().width
+            }
+            guard measure(text) > width else { return text }
+            var kept = Substring(text)
+            while !kept.isEmpty {
+                kept = kept.dropLast()
+                while kept.last == " " { kept = kept.dropLast() }
+                if measure(kept + "…") <= width { break }
+            }
+            return kept + "…"
+        }
+
         let headerFont = font(13, .medium)
         let accountFont = font(11)
         let rowFont = font(12)
@@ -571,6 +795,8 @@ final class HudCanvas: NSView {
         let pad = px(HudCanvas.padding)
         let line = px(HudCanvas.line)
         let right = bounds.width - pad
+        // Between the plan, the server tag and the age on a block's first line.
+        let tagGap = px(7)
         let dot = px(HudCanvas.dot)
         let pitch = dot + px(HudCanvas.dotGap)
         let barX = pad + px(HudCanvas.labelWidth) + px(HudCanvas.labelGap)
@@ -620,8 +846,39 @@ final class HudCanvas: NSView {
         for (index, entry) in entries.enumerated() {
             if index > 0 { top += px(HudCanvas.blockGap) }
 
-            write(hudPlan(entry.reading, labels: labels), headerFont, theme.header, top: top, height: line, x: pad)
-            write(hudAge(entry.updated, now: now), rowFont, theme.dim, top: top, height: line, right: right)
+            let mark = known(entry.reading.organizationId).flatMap { serverMarks[$0] }
+            let age = hudAge(entry.updated, now: now)
+            write(age, rowFont, mark == .failed ? theme.bad : theme.dim, top: top, height: line, right: right)
+            let ageWidth = NSAttributedString(string: age, attributes: [.font: rowFont]).size().width
+            // Where the plan has to end: short of the age, or of the tag below.
+            var planRight = age.isEmpty ? right : right - ageWidth - tagGap
+
+            // A block read from the server carries a tag left of its age: the
+            // far end of the line from the plan, so a long label has the most
+            // room before it reaches it. It is a label and must not pass for a
+            // control, hence small flat text on a flat fill, no glyph. The fill
+            // is the theme's good colour. Failed, it is the bad one and the tag
+            // says so: a word as well as a colour, in the same shape.
+            if let mark {
+                let text = NSMutableAttributedString(string: mark == .failed ? "SERVER FAIL" : "SERVER SYNC", attributes: [
+                    .font: font(8, .medium), .kern: 0.6 * scale,
+                    .foregroundColor: theme.background.withAlphaComponent(1),
+                ])
+                // The last letter's spacing is not part of the word.
+                let textSize = NSSize(width: text.size().width - 0.6 * scale, height: text.size().height)
+                let inset = px(4)
+                let height = px(11)
+                let tagRight = snap(right - (age.isEmpty ? 0 : ageWidth + tagGap))
+                let tag = NSRect(x: snap(tagRight - textSize.width - inset * 2), y: top + snap((line - height) / 2),
+                                 width: snap(textSize.width + inset * 2), height: height)
+
+                (mark == .failed ? theme.bad : theme.good).setFill()
+                notched(tag, px(1)).fill()
+                text.draw(at: NSPoint(x: snap(tag.minX + inset), y: snap(tag.minY + (height - textSize.height) / 2)))
+                planRight = tag.minX - tagGap
+            }
+            write(fitted(hudPlan(entry.reading, labels: labels), headerFont, width: planRight - pad),
+                  headerFont, theme.header, top: top, height: line, x: pad)
             top += line
 
             write(hudAccount(entry.reading, limit: accountLimit), accountFont, theme.dim,
@@ -811,6 +1068,8 @@ func snapshot(to path: String) -> Bool {
 
     let back = SnapshotBack(frame: NSRect(origin: .zero, size: size))
     let canvas = HudCanvas(frame: NSRect(x: margin, y: margin, width: panel.width, height: panel.height))
+    for id in arguments(named: "--server-on") { canvas.serverMarks[id] = .on }
+    for id in arguments(named: "--server-failed") { canvas.serverMarks[id] = .failed }
     canvas.show(entries, labels: loadLabels(), now: Date(), theme: currentTheme(), scale: scale)
     canvas.isGripLit = CommandLine.arguments.contains("--hover-grip")
     back.addSubview(canvas)
@@ -828,9 +1087,21 @@ func snapshot(to path: String) -> Bool {
 
 // MARK: - Menu bar
 
-final class Controller: NSObject {
+// The stored choice of server accounts is for the real folders. A run that
+// names another home or data folder, or its own accounts, has only the
+// accounts it names, and stores nothing.
+func serverAccountsForThisRun() -> [String]? {
+    let named = arguments(named: "--server-on")
+    let isElsewhere = argument("--home") != nil || argument("--data-dir") != nil
+    return isElsewhere || !named.isEmpty ? named : nil
+}
+
+final class Controller: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let hud = Hud()
+    let poller = ServerPoller(home: homeFolder, dataDir: dataFolder, onlyThisRun: serverAccountsForThisRun())
+    // What the panel shows now; the server submenu is filled from it.
+    private var shown: (entries: [Entry], labels: [String: String]) = ([], [:])
     lazy var watcher = FolderWatcher(path: dataFolder) { [weak self] in
         debug("usage-hp: reload after change")
         self?.refresh()
@@ -841,7 +1112,9 @@ final class Controller: NSObject {
     // file change announces: an age growing ("now" to "1m"), a window going
     // back to full when its reset time passes, and the folder first appearing.
     func start() {
+        poller.onChange = { [weak self] in self?.refresh() }
         refresh()
+        poller.start()
         let timer = Timer(timeInterval: refreshSeconds, repeats: true) { [weak self] _ in self?.refresh() }
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -852,6 +1125,16 @@ final class Controller: NSObject {
         watcher.startIfPossible()
         let entries = loadEntries()
         let labels = loadLabels()
+        shown = (entries, labels)
+
+        // The mark follows the choice: failed when the last attempt was not a
+        // success, whatever the file holds.
+        var marks: [String: ServerMark] = [:]
+        for id in poller.organizations {
+            let outcome = poller.outcome(id)
+            marks[id] = outcome == nil || outcome == .ok ? .on : .failed
+        }
+        hud.canvas.serverMarks = marks
         hud.update(entries, labels: labels, now: now)
 
         // A file caught half written: look again shortly, not at the next tick.
@@ -894,6 +1177,16 @@ final class Controller: NSObject {
         let themeItem = NSMenuItem(title: "테마", action: nil, keyEquivalent: "")
         themeItem.submenu = choices
         menu.addItem(themeItem)
+
+        // Filled when it opens (menuNeedsUpdate), so the config folders are
+        // read then and not on every refresh.
+        let server = NSMenu()
+        server.autoenablesItems = false
+        server.delegate = self
+        let serverItem = NSMenuItem(title: "서버에서 읽기", action: nil, keyEquivalent: "")
+        serverItem.submenu = server
+        menu.addItem(serverItem)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "종료", action: #selector(quitNow), keyEquivalent: "q")
         quit.target = self
@@ -901,6 +1194,32 @@ final class Controller: NSObject {
         item.menu = menu
     }
 
+    // The server submenu: one line per account, ticked when it is read from
+    // the server, then the action that asks now.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let rows = serverRows(
+            logins: discoverLogins(home: homeFolder), entries: shown.entries, labels: shown.labels,
+            ticked: poller.organizations, isOn: { self.poller.isOn($0) }, outcome: { self.poller.outcome($0) })
+
+        for row in rows {
+            let line = NSMenuItem(title: row.title, action: #selector(toggleServer(_:)), keyEquivalent: "")
+            line.target = self
+            line.representedObject = row.organizationId
+            line.state = row.isOn ? .on : .off
+            line.isEnabled = row.isEnabled
+            menu.addItem(line)
+        }
+
+        if !rows.isEmpty { menu.addItem(.separator()) }
+        let now = NSMenuItem(title: "지금 갱신", action: #selector(refreshServer), keyEquivalent: "")
+        now.target = self
+        now.isEnabled = !poller.organizations.isEmpty
+        menu.addItem(now)
+    }
+
+    // The title never says a request is out: a mark that comes and goes in the
+    // menu bar reads as something to press.
     func setTitle(_ text: String, color: NSColor?) {
         var attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small) + 1, weight: .medium)
@@ -916,6 +1235,13 @@ final class Controller: NSObject {
     @objc func chooseTheme(_ sender: NSMenuItem) {
         settings.set(sender.title, forKey: "theme")
         refresh()
+    }
+    @objc func toggleServer(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        poller.setOn(id, !poller.isOn(id))
+    }
+    @objc func refreshServer() {
+        poller.refreshNow()
     }
     @objc func quitNow() {
         hud.canvas.dropGrip()
@@ -944,6 +1270,147 @@ func allowCursorInBackground() {
     let connection = unsafeBitCast(connectionSymbol, to: DefaultConnection.self)()
     _ = unsafeBitCast(propertySymbol, to: SetProperty.self)(
         connection, connection, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+}
+
+// MARK: - Command line
+
+func say(_ text: String) {
+    FileHandle.standardOutput.write((text + "\n").data(using: .utf8) ?? Data())
+}
+
+if CommandLine.arguments.contains("--server-accounts") {
+    func line(_ login: Login) -> String {
+        [login.service, login.email, login.organizationId, login.plan ?? ""].joined(separator: "\t")
+    }
+    // The default folder first, always, with why it is not used; then the
+    // logins server mode can use.
+    let first = defaultLogin(home: homeFolder)
+    if let first { say(line(first) + (first.isExcluded ? "\texcluded: default folder" : "")) }
+    for login in discoverLogins(home: homeFolder) where login.configDir != first?.configDir { say(line(login)) }
+    exit(0)
+}
+
+if let file = argument("--server-apply") {
+    guard let folder = argument("--config-dir").map(withoutTrailingSlash),
+          let login = discoverLogins(home: homeFolder).first(where: { $0.configDir == folder && !$0.isExcluded }),
+          let response = FileManager.default.contents(atPath: file),
+          let limits = serverLimits(from: response) else { exit(1) }
+    exit(writeServerReading(limits, login: login, dataDir: dataFolder, now: Date()) ? 0 : 1)
+}
+
+if CommandLine.arguments.contains("--server-backoff-table") {
+    let poller = ServerPoller(home: homeFolder, dataDir: dataFolder, onlyThisRun: [])
+
+    // The waits after the same outcome `times` in a row, from the usual one.
+    func waits(_ outcome: ServerOutcome, _ times: Int) -> String {
+        var wait = ServerPoller.interval
+        var texts: [String] = []
+        for _ in 0..<times {
+            wait = poller.nextDelay(after: outcome, previous: wait)
+            texts.append(wait.isFinite ? String(Int(wait)) : "halt")
+        }
+        return texts.joined(separator: " ")
+    }
+
+    say("ok " + waits(.ok, 1))
+    say("offline " + waits(.offline, 5))
+    say("rateLimited(nil) " + waits(.rateLimited(retryAfter: nil), 5))
+    say("rateLimited(471) " + waits(.rateLimited(retryAfter: 471), 1))
+    say("rateLimited(7200) " + waits(.rateLimited(retryAfter: 7200), 1))
+    say("expired " + waits(.expired, 1))
+    say("unauthorized " + waits(.unauthorized, 1))
+    say("wrongOrganization " + waits(.wrongOrganization, 2))
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--server-menu-titles") {
+    let label = "PRO · b@example.com"
+    let cases: [(String, Bool, ServerOutcome?)] = [
+        ("none", true, nil), ("noLogin", false, nil), ("excluded", true, .excluded), ("expired", true, .expired),
+        ("unauthorized", true, .unauthorized), ("rateLimited", true, .rateLimited(retryAfter: nil)),
+        ("serverError", true, .serverError(500)), ("offline", true, .offline),
+        ("noKeychainItem", true, .noKeychainItem), ("noData", true, .noData), ("ok", true, .ok),
+        ("wrongOrganization", true, .wrongOrganization), ("unreadableFile", true, .unreadableFile),
+    ]
+    for (name, hasLogin, outcome) in cases {
+        say(name + "\t" + serverMenuTitle(label: label, hasLogin: hasLogin, outcome: outcome))
+    }
+    exit(0)
+}
+
+if CommandLine.arguments.contains("--server-menu") {
+    let on = Set(arguments(named: "--server-on") + arguments(named: "--server-failed"))
+    let failed = Set(arguments(named: "--server-failed"))
+    let rows = serverRows(
+        logins: discoverLogins(home: homeFolder), entries: loadEntries(), labels: loadLabels(),
+        ticked: on.sorted(), isOn: { on.contains($0) }, outcome: { failed.contains($0) ? .expired : nil })
+    for row in rows {
+        say((row.isOn ? "[x] " : "[ ] ") + row.title + (row.isEnabled ? "" : "\t(disabled)"))
+    }
+    exit(0)
+}
+
+if let id = argument("--server-once") {
+    let short = String(id.prefix(8))
+    guard let login = discoverLogins(home: homeFolder).first(where: { $0.organizationId == id }) else {
+        say(short + "\t" + ServerOutcome.noLogin.text)
+        exit(1)
+    }
+    // Before either way of asking, so neither reaches the keychain.
+    guard !login.isExcluded else {
+        say(short + "\t" + ServerOutcome.excluded.text)
+        exit(1)
+    }
+
+    let dumpProfile = CommandLine.arguments.contains("--dump-profile-shape")
+    if dumpProfile || CommandLine.arguments.contains("--dump-shape") {
+        // Names and kinds only, of the login's part of the keychain item and
+        // of the answer. Nothing is written. The profile form leaves the
+        // keychain part out and asks the profile endpoint instead.
+        DispatchQueue.global(qos: .utility).async {
+            // Read once: a second read could mean a second keychain prompt.
+            let item = readKeychainItem(service: login.service)
+            if !dumpProfile {
+                let fields = item.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+                say("keychain claudeAiOauth:")
+                jsonShape(fields?["claudeAiOauth"] ?? NSNull(), indent: "  ").forEach(say)
+            }
+
+            guard let token = item.flatMap(accessToken) else {
+                say(short + "\t" + ServerOutcome.noKeychainItem.text)
+                exit(1)
+            }
+            if let expires = token.expiresAt, expires <= Date().addingTimeInterval(60) {
+                say(short + "\t" + ServerOutcome.expired.text)
+                exit(1)
+            }
+            fetchOAuth(path: dumpProfile ? "/api/oauth/profile" : "/api/oauth/usage", token: token.token) { result in
+                switch result {
+                case .failure(let outcome):
+                    say(short + "\t" + outcome.text)
+                    exit(1)
+                case .success(let data):
+                    let answer = (try? JSONSerialization.jsonObject(with: data)) ?? NSNull()
+                    say(dumpProfile ? "profile:" : "response:")
+                    jsonShape(answer, indent: "  ").forEach(say)
+                    if dumpProfile {
+                        // Does the answer name the organization? The place of
+                        // each id and whether it is this login's, not the id.
+                        for found in uuidPaths(answer, matching: login.organizationId) {
+                            say(found.path + "\t" + (found.matches ? "matches-login" : "differs"))
+                        }
+                    }
+                    exit(0)
+                }
+            }
+        }
+    } else {
+        refreshFromServer(login, dataDir: dataFolder) { outcome in
+            say(short + "\t" + outcome.text)
+            exit(outcome == .ok ? 0 : 1)
+        }
+    }
+    dispatchMain()
 }
 
 let app = NSApplication.shared

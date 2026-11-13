@@ -3,5 +3,5 @@
 # Needs the Xcode command line tools (xcode-select --install).
 set -e
 cd "$(dirname "$0")"
-swiftc -O main.swift -o usage-hp-menubar
+swiftc -O main.swift server.swift -o usage-hp-menubar
 echo "built: $(pwd)/usage-hp-menubar"

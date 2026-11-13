@@ -50,6 +50,107 @@ const loginOnDisk = async ($: Dollar, home: string): Promise<Login> => {
 
 const safeOf = (text: string) => text.replace(/[^A-Za-z0-9._-]/g, '_')
 
+// The windows a published file holds; anything that is not one is dropped.
+const limitsOf = (file: unknown): Limit[] => {
+  const list = (file as { limits?: unknown } | null | undefined)?.limits
+
+  return Array.isArray(list)
+    ? list.filter((w): w is Limit => typeof w?.kind === 'string')
+    : []
+}
+
+// A reset time as an instant, so two spellings of one moment compare equal.
+// Missing or unparsable is NaN, which is near nothing and never in the future.
+const instantOf = (text: unknown) => (typeof text === 'string' ? Date.parse(text) : NaN)
+
+// Two writers can name one reset a few seconds apart; a minute is one moment.
+const near = (a: number, b: number) => Math.abs(a - b) <= 60_000
+
+// True when the reading cannot be this file's: the file still has a live
+// window of some kind, and the reading's window of that kind ends at another
+// moment. A window only moves its reset once the old one has passed.
+const conflicts = (reading: Limit[], file: Limit[], nowMs: number): boolean =>
+  reading.some(w => {
+    const at = instantOf(w.resetsAt)
+
+    return file.some(o => {
+      const fileAt = instantOf(o.resetsAt)
+
+      return o.kind === w.kind && fileAt > nowMs && !Number.isNaN(at) && !near(fileAt, at)
+    })
+  })
+
+// A published file of the same email under another organization.
+type Other = { key: string; file: Record<string, unknown> }
+
+// The file a reading belongs to once it conflicts with the resolved one: the
+// one whose window ends when the reading's does; failing that, the only other
+// file, when nothing live in it disagrees. No answer means write nowhere.
+const routeOf = (reading: Limit[], others: Other[], nowMs: number): Other | undefined => {
+  const matching = others.find(other =>
+    limitsOf(other.file).some(o =>
+      reading.some(w => w.kind === o.kind && near(instantOf(w.resetsAt), instantOf(o.resetsAt))),
+    ),
+  )
+  const only = others.length === 1 ? others[0] : undefined
+
+  return matching ?? (only && !conflicts(reading, limitsOf(only.file), nowMs) ? only : undefined)
+}
+
+// The other files of this email, one per organization. A file that cannot be
+// read counts as absent; a folder that cannot be listed is null, which is not
+// the same as having no other file.
+const othersOf = async (
+  $: Dollar,
+  folder: string,
+  ownKey: string,
+  email: string,
+  organizationId: string,
+): Promise<Other[] | null> => {
+  try {
+    const others: Other[] = []
+
+    for (const entry of await $.fs.list(folder)) {
+      if (
+        entry.kind !== 'file' ||
+        !entry.name.endsWith('.json') ||
+        entry.name === 'labels.json' ||
+        entry.name === `${ownKey}.json`
+      ) {
+        continue
+      }
+
+      try {
+        const file = JSON.parse(await $.fs.read(`${folder}/${entry.name}`))
+        const theirs = textOf(file?.organizationId)
+
+        if (file?.account === email && theirs && theirs !== organizationId) {
+          others.push({ key: entry.name.slice(0, -'.json'.length), file })
+        }
+      } catch {
+        // Unreadable: as if it were not there.
+      }
+    }
+
+    return others
+  } catch {
+    return null
+  }
+}
+
+// The last write this process made: which file it was and what it held. A
+// reading is the last API response, so right after a login change the same
+// reading turns up again under the new account's name.
+let written: { key: string; print: string } | null = null
+
+// True when the account changed but the reading did not: it is still the old
+// account's. The new account's first fresh reading differs and is written.
+const staleAfterSwitch = (
+  last: { key: string; print: string } | null,
+  key: string,
+  print: string,
+): boolean => last !== null && last.key !== key && last.print === print
+
 // The menu bar item reads these files, one per organization: one email can
 // hold two plans, and two sessions on different plans must not overwrite each
 // other. An empty reading never replaces a good one, and a failure here must
@@ -75,7 +176,50 @@ const publish = async ($: Dollar, reading: Limit[] | null) => {
     const envOrganizationId = await set($.env.get('CLAUDE_CODE_ORGANIZATION_UUID'))
     const email = envEmail ?? disk.email ?? 'unknown'
     const organizationId = (envEmail ? envOrganizationId : disk.organizationId) ?? 'unknown'
-    const path = `${home}/.claude/usage-hp/${safeOf(email)}__${safeOf(organizationId)}.json`
+    const key = `${safeOf(email)}__${safeOf(organizationId)}`
+    const folder = `${home}/.claude/usage-hp`
+    const path = `${folder}/${key}.json`
+    const print = JSON.stringify(reading)
+    const source = (await set($.env.get('CLAUDE_CODE_ENTRYPOINT'))) ?? 'unknown'
+    const updatedAt = new Date().toISOString()
+
+    let before: unknown
+
+    try {
+      before = JSON.parse(await $.fs.read(path))
+    } catch {
+      // No earlier file: nothing to keep or compare with.
+    }
+
+    // The terminal and the desktop app share the login record on disk while
+    // each can be signed in to its own organization of one email, so the
+    // resolved organization can be the other one's. The reading then goes to
+    // the file it does belong to, or nowhere. A folder that cannot be listed
+    // leaves the resolved file as the target, as if nothing disagreed.
+    if (conflicts(reading, limitsOf(before), Date.now())) {
+      const others = await othersOf($, folder, key, email, organizationId)
+
+      if (others !== null) {
+        const route = routeOf(reading, others, Date.now())
+
+        if (!route || staleAfterSwitch(written, route.key, print)) {
+          return
+        }
+
+        // Its own name and plan stay: the login on disk is the wrong organization.
+        await $.fs.write(
+          `${folder}/${route.key}.json`,
+          JSON.stringify({ ...route.file, source, updatedAt, limits: reading }, null, 2),
+        )
+        written = { key: route.key, print }
+
+        return
+      }
+    }
+
+    if (staleAfterSwitch(written, key, print)) {
+      return
+    }
 
     // The name and plan are only on disk, and only for the organization the
     // terminal is signed in to; otherwise keep what an earlier write recorded.
@@ -85,16 +229,11 @@ const publish = async ($: Dollar, reading: Limit[] | null) => {
       known = { organization: disk.organization, plan: disk.plan }
     }
 
-    if (!known.organization || !known.plan) {
-      try {
-        const before = JSON.parse(await $.fs.read(path))
-        known = {
-          organization: known.organization ?? textOf(before?.organization),
-          plan: known.plan ?? textOf(before?.plan),
-        }
-      } catch {
-        // No earlier file: nothing to keep.
-      }
+    const earlier = before as { organization?: unknown; plan?: unknown } | null | undefined
+
+    known = {
+      organization: known.organization ?? textOf(earlier?.organization),
+      plan: known.plan ?? textOf(earlier?.plan),
     }
 
     await $.fs.write(
@@ -105,14 +244,15 @@ const publish = async ($: Dollar, reading: Limit[] | null) => {
           organizationId,
           ...(known.organization ? { organization: known.organization } : {}),
           ...(known.plan ? { plan: known.plan } : {}),
-          source: (await set($.env.get('CLAUDE_CODE_ENTRYPOINT'))) ?? 'unknown',
-          updatedAt: new Date().toISOString(),
+          source,
+          updatedAt,
           limits: reading,
         },
         null,
         2,
       ),
     )
+    written = { key, print }
   } catch {
     // Nothing to do: the next measurement writes again.
   }

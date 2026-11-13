@@ -18,7 +18,7 @@ English | [한국어](README.ko.md)
 
 ## Why
 
-Checking how much of a Claude plan is left usually means keeping a usage page open in a browser. This project puts the two numbers that matter, what is left of the 5-hour window and of the weekly window, in a small always-visible HUD and in the menu bar. It does so without reading any login token: it only records what Claude Code sessions on your Mac are already told.
+Checking how much of a Claude plan is left usually means keeping a usage page open in a browser. This project puts the two numbers that matter, what is left of the 5-hour window and of the weekly window, in a small always-visible HUD and in the menu bar. By default it does so without reading any login token: it only records what Claude Code sessions on your Mac are already told.
 
 ## Features
 
@@ -29,10 +29,10 @@ Checking how much of a Claude plan is left usually means keeping a usage page op
 - **Reset time** for every window, in local time; a reset on a later day also shows its date.
 - **Age of each reading** (`now`, `4m`, `2h`, `3d`), so a stale number is visible as stale.
 - **Dot-matrix terminal look**: a near-black square panel with notched corners and monospaced text, in six built-in colour themes.
-- **Menu bar item** showing the most recently updated plan, for example `5h 61% · 7d 67%`. Its menu holds the actions: hide or show the HUD, theme, quit.
+- **Menu bar item** showing the most recently updated plan, for example `5h 61% · 7d 67%`. Its menu holds the actions: hide or show the HUD, theme, reading from the server, quit.
 - **Always-on-top HUD** that never takes keyboard focus, shows on every Space and beside full-screen apps, can be dragged anywhere, and can be resized from its bottom-right corner (1.0x to 2.5x). It remembers its position and size, and can be hidden from the menu.
 - **Optional custom names** per plan through a small `labels.json` file.
-- **No tokens, no credentials, no network.** The app only reads local JSON files.
+- **No tokens, no credentials, no network by default.** The app only reads local JSON files, unless you turn on [reading from the server](#reading-from-the-server-optional-off-by-default) for an account.
 
 The menu bar item's menu is currently in Korean; the HUD itself uses short English labels.
 
@@ -142,10 +142,11 @@ rm ~/Library/LaunchAgents/com.local.usage-hp-menubar.plist
 
 - **HUD**: drag it anywhere to move it. Each block is one plan; `5H` is the 5-hour window and `7D` the weekly window. The dots and the percentage show what is **left**, not what is used. With no reading yet it shows one line, `측정값 없음`.
 - **Resizing**: the three small squares in the HUD's bottom-right corner are a resize grip. Drag it to scale the whole HUD uniformly, from 1.0x (the base size, also the minimum) up to 2.5x. Double-click it to go back to 1.0x. The scale is remembered.
-- **Menu bar item**: the title follows the most recently updated plan and turns orange at 50% or less left, red below 20%. Plan details are shown in the HUD only; the menu holds the three actions below.
+- **Menu bar item**: the title follows the most recently updated plan and turns orange at 50% or less left, red below 20%. Plan details are shown in the HUD only; the menu holds the actions below.
 - **Updates are immediate**: the app watches `~/.claude/usage-hp/` and redraws as soon as the mod writes a reading, so there is nothing to press. A 30-second timer remains only for what no file change announces: the age beside each plan growing (`now` to `1m`) and a window going back to 100% when its reset time passes.
 - **플로팅 창 숨기기 / 보이기** hides or shows the HUD. The choice is remembered.
 - **테마** switches the colour theme.
+- **서버에서 읽기** chooses the accounts that are read from Anthropic's server; see [below](#reading-from-the-server-optional-off-by-default). Off for every account by default.
 - **종료** quits the app.
 
 ### Custom names (optional)
@@ -155,6 +156,27 @@ Create `~/.claude/usage-hp/labels.json` to give a plan your own name. It replace
 ```json
 { "<organization id>": "Work team" }
 ```
+
+### Reading from the server (optional, off by default)
+
+The mod only learns a plan's numbers when a Claude Code session on this Mac gets a response. If a plan is mostly used elsewhere (another device, a remote agent), its block goes stale. For such a plan you can let the app ask Anthropic's server directly.
+
+- **Turning it on**: open the menu, then **서버에서 읽기**, and tick the account. It is per account; every account is unticked until you tick it. Untick it to turn it off. An account with no terminal login on this Mac is greyed out (`터미널 로그인 없음`).
+- **Logins in the default config folder (`~/.claude`) are not supported yet**: such an account is greyed out (`기본 폴더 로그인은 아직 지원 안 함`). The Claude desktop app shares that folder's `.claude.json` and can change the organization it names while the Keychain still holds the terminal's login for another one, so a reading could land under the wrong plan. Only logins in a separate config folder (`~/.claude-<name>`, used with `CLAUDE_CONFIG_DIR`) can be ticked; when an organization is logged in in both, the separate folder is the one used.
+- **What a ticked account does**: at once (up to 30 seconds later if a request for another account is still out), and then every 5 minutes, the app reads that account's Claude Code login from the macOS Keychain (with `/usr/bin/security`), sends one `GET https://api.anthropic.com/api/oauth/usage` with it, and writes the answer to the same file in `~/.claude/usage-hp/` that the mod writes. **지금 갱신** asks right away. Polling pauses while the Mac sleeps, and after a failed request the wait grows, up to 60 minutes, or longer when the server's `Retry-After` asks for longer.
+- **The login is checked against the account first**: before asking for usage, the app asks the server (`GET https://api.anthropic.com/api/oauth/profile`) which organization the login in the Keychain belongs to, and if it is not the ticked account's (for example right after a `/login` to another organization) it asks for nothing more and writes nothing; the line says `다른 조직으로 로그인됨`. The answer is remembered in memory only, so this costs one extra request each time the login is renewed and once after the app starts, not one per poll. A login that carries no expiry time is not remembered and is asked about on every poll; the logins Claude Code writes carry one.
+- **Unticked accounts are untouched**: no Keychain read, no request. This holds per config folder: if a ticked account's folder has since been logged in to another organization, the login now in that folder is read and the one profile request above is sent with it. The Keychain item of the default config folder is never read, ticked or not.
+- **The token is not kept**: it is read for each attempt, used for that attempt's requests and dropped. It is never written to a file, preferences or a log, never passed on a command line, and never refreshed; the app writes nothing to the Keychain.
+- **In the HUD**: a ticked account carries a small `SERVER SYNC` tag left of its age (`SERVER SYNC 2m`), filled with the theme's colour for a well-filled bar. It is a label, not a button. If the last attempt failed the tag reads `SERVER FAIL` and is filled with the theme's red (`SERVER FAIL 3h`), and the last numbers stay; the reason is on that account's line in the submenu. The menu bar title does not change while a request is out.
+- **When the login has expired**: the app does not refresh it. Run `claude` once with that account's config directory and Claude Code renews it; the app picks the new one up by itself.
+
+Know before you tick:
+
+- **The endpoint is undocumented.** Its address, headers and answer were taken from public tools that use it. It can change or be closed at any time, and Anthropic has not said that using a Claude Code login outside Claude Code is allowed. If it stops working, only this mode stops; the mod keeps feeding the HUD.
+- **The token can do more than read usage.** It is the login of the whole account. That is why it is only read for ticked accounts and never stored, but it does pass through this app's memory every 5 minutes.
+- **The request limit is shared with Claude Code.** Claude Code asks the same endpoint, and it is known to rate-limit; polling here can occasionally make Claude Code's own usage screen fail, and the other way round.
+- **macOS may ask for permission** to let `security` read the item. If it does, "Always Allow" applies to `security`, not to this app.
+- Only config directories directly under your home folder are found: `~/.claude` and `~/.claude-*`.
 
 ## Privacy & security
 
@@ -171,9 +193,14 @@ What the mod writes:
 What the app reads and writes:
 
 - it reads the JSON files in `~/.claude/usage-hp/`, including the optional `labels.json`;
-- it stores the HUD position, its scale, its visibility and the chosen theme in its own macOS preferences.
+- it stores the HUD position, its scale, its visibility and the chosen theme in its own macOS preferences;
+- only for accounts you tick under **서버에서 읽기**: it reads that account's Claude Code login from the Keychain, sends GET requests to `api.anthropic.com` (a profile request when the login is new or renewed, then the usage request), and writes the answer to that organization's file in `~/.claude/usage-hp/`, the same file the mod writes.
 
-Nothing else. No OAuth token, session cookie, API key or Keychain item is read. Neither part makes a network request, and nothing leaves your Mac. Note that the files in `~/.claude/usage-hp/` contain your account email in plain text, and the HUD shows it on screen; both stay local.
+Nothing else, by default. No OAuth token, session cookie, API key or Keychain item is read. Neither part makes a network request, and nothing leaves your Mac.
+
+The one exception is opt-in. To list the accounts under **서버에서 읽기**, the app reads the `oauthAccount` entry of the `.claude.json` files under your home folder (no token is there). For each account you tick, it reads that account's Claude Code login from the Keychain, sends it to `api.anthropic.com` in one usage request every 5 minutes (plus one profile request when the login is renewed), and stores the ticked organization ids in its preferences. The token is not stored, logged or refreshed. See [Reading from the server](#reading-from-the-server-optional-off-by-default).
+
+Note that the files in `~/.claude/usage-hp/` contain your account email in plain text, and the HUD shows it on screen; both stay local.
 
 The app makes one undocumented CoreGraphics call (`CGSSetConnectionProperty` with `SetsCursorInBackground`), solely so the resize cursor can appear over the HUD's corner while the app is in the background; it is looked up at run time, and the app works without it.
 
